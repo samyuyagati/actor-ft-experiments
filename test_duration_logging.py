@@ -15,17 +15,10 @@ class Actor:
 
 	def add(self):
 		self.count += 1
-		#time.sleep()
 		return self.count
 
 	def get_pid(self):
 		return os.getpid()
-
-	def increment_and_possibly_fail(self):
-		if self.count == 10:
-			os._exit(0)
-		self.count += 1
-		return self.count
 
 ray.init(ignore_reinit_error=True)
 actor = Actor.remote()
@@ -33,16 +26,14 @@ pid = ray.get(actor.get_pid.remote())
 print("pid:", pid)
 
 start1 = time.time()
-count = ray.get([actor.increment_and_possibly_fail.remote() for i in range(8)])
+count = ray.get([actor.add.remote() for i in range(8)])
 print(count)
 end1 = time.time()
 
-#os.kill(pid, signal.SIGSTOP)
-#ray.get(actor.increment_and_possibl.remote())
-#actor.kill.remote()
+os.kill(pid, signal.SIGKILL)
 
 start = time.time()
-count = ray.get([actor.increment_and_possibly_fail.remote() for i in range(8)])
+count = ray.get([actor.add.remote() for i in range(8)])
 print(count)
 end = time.time()
 
