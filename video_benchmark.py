@@ -28,7 +28,7 @@ class Decoder:
     # Utility function to be used with ray.get to check that
     # Decoder actor has been fully initialized.
     def ready(self):
-	return
+        return
 
 
 # Resizer class uses OpenCV library to resize individual video frames.
@@ -36,18 +36,18 @@ class Decoder:
 class Resizer:
     # TODO should it have other state?
     def __init__(self, scale_factor=0.5):
-	self.scale_factor = 0.5
+        self.scale_factor = 0.5
 
     def transformation(self, frame):
         with ray.profiling.profile("resize"):
-	    new_width = int(self.scale_factor * frame.shape[1])
-	    new_height = int(self.scale_factor * frame.shape[0])
-	    return (new_width, new_height)
+            new_width = int(self.scale_factor * frame.shape[1])
+            new_height = int(self.scale_factor * frame.shape[0])
+            return (new_width, new_height)
 
     # Utility function to be used with ray.get to check that
     # Resizer actor has been fully initialized.
     def ready(self):
-	return
+        return
 
 
 @ray.remote(num_cpus=0, resources={"head": 1})
@@ -74,19 +74,19 @@ class SignalActor:
 class Viewer:
     def __init__(self, video_pathname):
 #	self.out = cv2.VideoWriter(output_path,cv2.VideoWriter_fourcc('M','J','P','G'), fps, (width,height))
-	self.video_pathname = video_pathname
+        self.video_pathname = video_pathname
         self.v = cv2.VideoCapture(video_pathname)
 
     def send(self, transformation):
-	success, frame = self.v.read()
-	assert success
-	resized = cv2.resize(frame, transformation, interpolation=cv2.INTER_AREA)
-	frame_out = cv2.hconcat([frame, resized])
-	cv2.imshow("Before and After", frame_out)
-	cv2.waitKey(1) # Leave image up until user presses a key.
+        success, frame = self.v.read()
+        assert success
+        resized = cv2.resize(frame, transformation, interpolation=cv2.INTER_AREA)
+        frame_out = cv2.hconcat([frame, resized])
+        cv2.imshow("Before and After", frame_out)
+        cv2.waitKey(1) # Leave image up until user presses a key.
 
     def ready(self):
-	return
+        return
 
 
 @ray.remote(num_cpus=0)
@@ -96,7 +96,7 @@ class Sink:
         self.num_frames_left = {}
         self.latencies = defaultdict(list)
 
-	self.viewer = viewer
+        self.viewer = viewer
         self.last_view = None
 
     def set_expected_frames(self, video_index, num_frames):
@@ -121,7 +121,7 @@ class Sink:
                 self.signal.send.remote()
 
 	    # Only view the first video to check for correctness.
-	    if self.viewer is not None and video_index == 0:
+            if self.viewer is not None and video_index == 0:
                 self.last_view = self.viewer.send.remote(transform)
 
 
@@ -135,7 +135,7 @@ class Sink:
 
 def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp):
     # Create the decoder actor.
-    decoder = Decoder.remote(video_pathname, 0))
+    decoder = Decoder.remote(video_pathname, 0)
     ray.get(decoder.ready.remote())
 
     # Create the frame resizing (i.e., processing) actor.
@@ -147,9 +147,9 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
     prev_frame = decoder.decode.remote(start_frame_idx)
 
     for i in range(start_frame_idx, num_frames - 1):
-	frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps 
-	frame = decoder.decode.remote(start_frame_idx + i + 1) # Why not just i + 1?	
-	transformation = resizer.transformation.options(resources={resource: 1}).remote(frame)
+        frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps 
+        frame = decoder.decode.remote(start_frame_idx + i + 1) # Why not just i + 1?	
+        transformation = resizer.transformation.options(resources={resource: 1}).remote(frame)
         final = sink.send.remote(video_index, i, transformation, frame_timestamp)
 
     # Block on processing of final frame so that latencies include all frames
@@ -157,14 +157,15 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
     return ray.get(final)
 
 
-def process_videos(video_pathnames, num_sinks, owner_resources, resources, view=False):
+def process_videos(video_pathnames, output_filename, resources, owner_resources, 
+	sink_resources, max_frames, num_sinks, view=False):
     # Set up sinks. 
     signal = SignalActor.remote(len(video_pathnames))
     ray.get(signal.ready.remote())
 
     viewer = None
     if view:
-	viewer = Viewer.remote(video_pathnames[0])
+        viewer = Viewer.remote(video_pathnames[0])
 
     sinks = [Sink.options(resources={
         sink_resources[i % len(sink_resources)]: 1
@@ -222,4 +223,150 @@ def main(args):
 
     num_sink_nodes = len(video_resources) # For now, one sink per video. 
     sink_resources = ["video_sink:{}".format(i) for i in range(num_sink_nodes)]
-    # TODO Finish this function (based on Stephanie's code, but try to take just relevant parts).
+    
+    num_required_nodes = len(args.video_path) + num_owner_nodes + num_sink_nodes
+    assert args.num_nodes >= num_required_nodes, ("Requested {} nodes, need {}".format(args.num_nodes, num_required_nodes)) 
+
+    # Just do local for now, add remote later.
+    if args.local:
+        config = {
+            "num_heartbeats_timeout": 10,
+            "lineage_pinning_enabled": 1,
+            "free_objects_period_milliseconds": -1,
+            "object_manager_repeated_push_delay_ms": 1000,
+            "task_retry_delay_ms": 100,
+        }
+        if args.centralized:
+            config["centralized_owner"] = 1
+        cluster = ray.cluster_utils.Cluster()
+        cluster.add_node(
+            num_cpus=0, _system_config=config, # include_webui=False,
+            resources={"head": 100})
+        num_nodes = args.num_nodes
+        for _ in range(num_nodes):
+            cluster.add_node(
+                object_store_memory=10**9,
+                num_cpus=2,
+                _internal_config=system_config)
+        cluster.wait_for_nodes()
+        address = cluster.address
+    else:
+        address = "auto"
+
+    ray.init(address=address)
+
+    nodes = [node for node in ray.nodes() if node["Alive"]]
+    while len(nodes) < args.num_nodes + 1:
+        time.sleep(1)
+        print("{} nodes found, waiting for nodes to join".format(len(nodes)))
+        nodes = [node for node in ray.nodes() if node["Alive"]]
+
+    # TODO add in non-local
+
+    for node in nodes:
+        for resource in node["Resources"]:
+            if resource.startswith("video"):
+                ray.experimental.set_resource(resource, 0, node["NodeID"])
+
+    nodes = [node for node in ray.nodes() if node["Alive"]]
+    print("All nodes joined")
+    for node in nodes:
+        print("{}:{}".format(node["NodeManagerAddress"], node["NodeManagerPort"]))
+
+    head_node = [node for node in nodes if "head" in node["Resources"]]
+    assert len(head_node) == 1
+    head_ip = head_node[0]["NodeManagerAddress"]
+    nodes.remove(head_node[0])
+    assert len(nodes) >= len(video_resources) + num_owner_nodes, ("Found {} nodes, need {}".format(len(nodes), len(video_resources) + num_owner_nodes))
+
+    worker_ip = None
+    worker_resource = None
+    owner_ip = None
+    owner_resource = None
+    node_index = 0
+    for node, resource in zip(nodes, sink_resources + owner_resources + video_resources):
+        if "CPU" not in node["Resources"]:
+            continue
+
+        print("Assigning", resource, "to node", node["NodeID"], node["Resources"])
+        ray.experimental.set_resource(resource, 100, node["NodeID"])
+
+        if "owner" in resource:
+            owner_resource = resource
+            owner_ip = node["NodeManagerAddress"]
+        elif "video:" in resource:
+            worker_resource = resource
+            worker_ip = node["NodeManagerAddress"]
+
+    if args.failure or args.owner_failure:
+        if args.local:
+            t = threading.Thread(
+                target=process_videos, args=(args.video_path, args.output,
+                    args.view, video_resources, owner_resources, sink_resources,
+                    args.max_frames, args.num_sinks, args.v07, args.checkpoint_interval))
+            t.start()
+
+            if args.failure:
+                time.sleep(10)
+                cluster.remove_node(cluster.list_all_nodes()[-1], allow_graceful=False)
+
+                cluster.add_node(
+                    object_store_memory=10**9,
+                    num_cpus=2,
+                    resources={"video:0": 100},
+                    _internal_config=system_config)
+
+            t.join()
+        else:
+            if args.failure:
+                ip = worker_ip
+                resource = worker_resource
+            else:
+                ip = owner_ip
+                resource = owner_resource
+            print("Killing", ip, "with resource", resource, "after 10s")
+            def kill():
+                cmd = 'ssh -i ~/ray_bootstrap_key.pem -o StrictHostKeyChecking=no {} "bash -s" -- < /home/ubuntu/ray/benchmarks/{} {}'.format(ip, "restart_0_7.sh" if args.v07 else "restart.sh", head_ip)
+                print(cmd)
+                time.sleep(10)
+                os.system(cmd)
+                recovered = False
+                while not recovered:
+                    time.sleep(1)
+                    for node in ray.nodes():
+                        if node["NodeManagerAddress"] == ip and "CPU" in node["Resources"] and resource not in node["Resources"]:
+                            print(node)
+                            ray.experimental.set_resource(resource, 100, node["NodeID"])
+                            recovered = True
+                            break
+                print("Restarted node at IP", ip)
+            t = threading.Thread(target=kill)
+            t.start()
+            process_videos(args.video_path, args.output, args.view,
+                    video_resources, owner_resources, sink_resources, args.max_frames,
+                    args.num_sinks, args.v07, args.checkpoint_interval)
+            t.join()
+    else:
+        process_videos(args.video_path, args.output,
+                video_resources, owner_resources, sink_resources, args.max_frames,
+                args.num_sinks, view=args.view)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Run the video benchmark.")
+
+    parser.add_argument("--num-nodes", required=True, type=int)
+    parser.add_argument("--video-path", required=True, nargs='+', type=str)
+    parser.add_argument("--output", type=str)
+    parser.add_argument("--local", action="store_true")
+    parser.add_argument("--failure", action="store_true")
+    parser.add_argument("--owner-failure", action="store_true")
+    parser.add_argument("--timeline", default=None, type=str)
+    parser.add_argument("--view", action="store_true")
+    parser.add_argument("--max-frames", default=600, type=int)
+    parser.add_argument("--num-sinks", default=1, type=int)
+    parser.add_argument("--num-owners-per-node", default=1, type=int)
+    parser.add_argument("--centralized", action="store_true")
+    args = parser.parse_args()
+    main(args)
