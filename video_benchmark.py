@@ -19,16 +19,21 @@ from collections import defaultdict
 # App-level but keep all frames: set max_retries > 0. May process out of order,
 #    but ok b/c of idempotence.
 # Checkpointing: kill all actors and restart from last frame.
-#    fake checkpoint that just records frame number (way to sync processes)
+#    DONE fake checkpoint that just records frame number (way to sync processes)
 #    just do this at the application level (wait on Sink to see when it receives
 #    frame k and take the checkpoint to do a checkpoint every k frames) (L217 of
-#    Stephanie's code). Restart after fail should kill all then read checkpoint
+#    Stephanie's code). 
+#    Restart after fail should kill all then read checkpoint
 #    frame from file, and start processing from there. 
 # Logging: restart resizing actor and simulate replay from last checkpoint.
 #    for logging, use existing simulate replay code but add in checkpoint idea.
 # DONE For failure: kill resizer actor and restart it. 
 # Kill actor w/ PID for failure. Ideally would probably want large single node
 # with multiple frames.
+
+# TODO should I make a process_videos or process_chunk actor so that the
+# kill-all thing is easier to make sense of? TODO where does execution resume?
+# Do I set task retries to 0 for all and manually resubmit??
 
 NUM_WORKERS_PER_VIDEO = 1
 
@@ -66,13 +71,23 @@ class Decoder:
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class Resizer:
     def __init__(self, scale_factor=0.5):
-        self.scale_factor = 0.5
+        self.scale_factor = scale_factor
+        self.start_frame_idx = 0
+        # If restarting from checkpoint
+        if os.path.exists("checkpoint.txt"):
+            print("Resizer recovering from checkpoint")
+            with open("checkpoint.txt", "r") as f:
+                self.start_frame_idx = int(f.read())
+        print("Resizer start frame idx: ", self.start_frame_idx)
 
     def transformation(self, frame):
         with ray.profiling.profile("resize"):
             new_width = int(self.scale_factor * frame.shape[1])
             new_height = int(self.scale_factor * frame.shape[0])
             return (new_width, new_height)
+
+    def get_start_frame_idx(self):
+        return self.start_frame_idx
 
     # Utility fn used to simulate failures.
     def get_pid(self):
@@ -136,10 +151,12 @@ class Viewer:
 
 @ray.remote(num_cpus=0)
 class Sink:
-    def __init__(self, signal, viewer):
+    # Default checkpoint_frequency=0 --> no checkpointing.
+    def __init__(self, signal, viewer, checkpoint_frequency=0):
         self.signal = signal
         self.num_frames_left = {}
         self.latencies = defaultdict(list)
+        self.checkpoint_frequency = checkpoint_frequency
 
         self.viewer = viewer
         self.last_view = None
@@ -164,6 +181,11 @@ class Sink:
                 if self.last_view is not None:
                     ray.get(self.last_view)
                 self.signal.send.remote()
+
+        # Update checkpoint
+        if self.checkpoint_frequency > 0 and frame_index % self.checkpoint_frequency == 0:
+            with open("checkpoint.txt", "w") as f:
+                f.write(str(frame_index)) 
 
 	    # Only view the first video to check for correctness.
             if self.viewer is not None and video_index == 0:
@@ -195,8 +217,9 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
     resizer_pid = ray.get(resizer.get_pid.remote())
     print("Resizer PID: ", resizer_pid)
 
-    # Process frames
-    start_frame_idx = 0
+    # Set start point
+    start_frame_idx = ray.get(resizer.get_start_frame_idx.remote())
+    print("Start frame idx: ", start_frame_idx)
 
     # If failure simulation: determine point to fail
     fail_point = int(((num_frames - 1) - start_frame_idx) / 2)
@@ -208,7 +231,11 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
         if simulate_failure and i == fail_point and start_frame_idx == 0:
             print("Killing resizer")
             os.kill(resizer_pid, signal.SIGKILL) 
-
+        
+        # Need to set s_f_i again because resizer actor would pick up from
+        # here on restart (I think). NO -- restarts whole submitted task,
+        # which is why we need the timestamps.
+#        start_frame_idx = ray.get(resizer.get_start_frame_idx.remote())
         frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps
 
         # Process the frame 
@@ -223,7 +250,8 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
 
 
 def process_videos(video_pathnames, output_filename, resources, owner_resources, 
-	sink_resources, max_frames, num_sinks, simulate_failure=False, view=False):
+	sink_resources, max_frames, num_sinks, checkpoint_frequency, 
+    simulate_failure=False, view=False):
     # Set up sinks. 
     signal = SignalActor.remote(len(video_pathnames))
     ray.get(signal.ready.remote())
@@ -234,7 +262,7 @@ def process_videos(video_pathnames, output_filename, resources, owner_resources,
 
     sinks = [Sink.options(resources={
         sink_resources[i % len(sink_resources)]: 1
-        }).remote(signal, viewer) for i in range(num_sinks)]
+        }).remote(signal, viewer, checkpoint_frequency) for i in range(num_sinks)]
     ray.get([sink.ready.remote() for sink in sinks])
 
     for i, video_pathname in enumerate(video_pathnames):
@@ -354,7 +382,11 @@ def main(args):
             worker_ip = node["NodeManagerAddress"]
     process_videos(args.video_path, args.output,
             video_resources, owner_resources, sink_resources, args.max_frames,
-            args.num_sinks, simulate_failure=args.failure, view=args.view)
+            args.num_sinks, args.checkpoint_freq,
+            simulate_failure=args.failure, view=args.view)
+    # Delete checkpoint file to have a clean start next run.
+    if os.path.exists("checkpoint.txt"):
+        os.remove("checkpoint.txt")
 
 
 if __name__ == "__main__":
@@ -372,5 +404,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-sinks", default=1, type=int)
     parser.add_argument("--num-owners-per-node", default=1, type=int)
     parser.add_argument("--centralized", action="store_true")
+    parser.add_argument("--checkpoint-freq", default=0, type=int)
     args = parser.parse_args()
     main(args)
