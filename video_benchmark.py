@@ -1,14 +1,34 @@
 import asyncio
 import cv2
 import numpy as np
+import os
 import os.path
 from ray import profiling
 import ray
 import ray.cluster_utils
+import signal
 import time
 
 from collections import defaultdict
 
+# Application-level semantics: drops some frames in the middle (skip failed
+#    frame; Sink gets error but ignore it and keep executing). Default should be
+#    to not retry tasks, so there should just be an error. Should work out of
+#    the box. Need to make sure actor is auto-restarted. Set max_restarts > 0 
+#    but max_retries = 0.
+# App-level but keep all frames: set max_retries > 0. May process out of order,
+#    but ok b/c of idempotence.
+# Checkpointing: kill all actors and restart from last frame.
+#    fake checkpoint that just records frame number (way to sync processes)
+#    just do this at the application level (wait on Sink to see when it receives
+#    frame k and take the checkpoint to do a checkpoint every k frames) (L217 of
+#    Stephanie's code). Restart after fail should kill all then read checkpoint
+#    frame from file, and start processing from there. 
+# Logging: restart resizing actor and simulate replay from last checkpoint.
+#    for logging, use existing simulate replay code but add in checkpoint idea.
+# DONE For failure: kill resizer actor and restart it. 
+# Kill actor w/ PID for failure. Ideally would probably want large single node
+# with multiple frames.
 
 NUM_WORKERS_PER_VIDEO = 1
 
@@ -20,7 +40,14 @@ class Decoder:
         self.v = cv2.VideoCapture(filename)
         self.v.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    def decode(self, frame):
+    def decode(self, frame, frame_timestamp):
+        # Simulate an incoming video stream; need to sleep to output one
+        # frame per 1/fps seconds in order to do this.
+        diff = frame_timestamp - time.time()
+        if diff > 0:
+            time.sleep(diff)
+
+        # Decode frame
         if frame != self.v.get(cv2.CAP_PROP_POS_FRAMES):
             print("next frame", frame, ", at frame", self.v.get(cv2.CAP_PROP_POS_FRAMES))
             self.v.set(cv2.CAP_PROP_POS_FRAMES, frame)
@@ -38,7 +65,6 @@ class Decoder:
 # Resizer class uses OpenCV library to resize individual video frames.
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class Resizer:
-    # TODO should it have other state?
     def __init__(self, scale_factor=0.5):
         self.scale_factor = 0.5
 
@@ -47,6 +73,10 @@ class Resizer:
             new_width = int(self.scale_factor * frame.shape[1])
             new_height = int(self.scale_factor * frame.shape[0])
             return (new_width, new_height)
+
+    # Utility fn used to simulate failures.
+    def get_pid(self):
+        return os.getpid()
 
     # Utility function to be used with ray.get to check that
     # Resizer actor has been fully initialized.
@@ -154,7 +184,7 @@ class Sink:
 
 
 @ray.remote(num_cpus=0)
-def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp):
+def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure=False):
     # Create the decoder actor.
     decoder = Decoder.remote(video_pathname, 0)
     ray.get(decoder.ready.remote())
@@ -162,16 +192,30 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
     # Create the frame resizing (i.e., processing) actor.
     resizer = Resizer.options(resources={resource: 1}).remote()
     ray.get(resizer.ready.remote())
+    resizer_pid = ray.get(resizer.get_pid.remote())
+    print("Resizer PID: ", resizer_pid)
 
     # Process frames
     start_frame_idx = 0
-    prev_frame = decoder.decode.remote(start_frame_idx)
+
+    # If failure simulation: determine point to fail
+    fail_point = int(((num_frames - 1) - start_frame_idx) / 2)
+    print("Fail point: ", fail_point)
 
     for i in range(start_frame_idx, num_frames - 1):
-        frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps 
-        frame = decoder.decode.remote(start_frame_idx + i + 1) # Why not just i + 1?	
+        # start_frame_idx == 0 indicates first execution; don't want to
+        # fail on re-execution.
+        if simulate_failure and i == fail_point and start_frame_idx == 0:
+            print("Killing resizer")
+            os.kill(resizer_pid, signal.SIGKILL) 
+
+        frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps
+
+        # Process the frame 
+        frame = decoder.decode.remote(start_frame_idx + i + 1, frame_timestamp) 	
         transformation = resizer.transformation.remote(frame)
-        final = sink.send.remote(video_index, i, transformation, frame_timestamp)
+        final = sink.send.remote(video_index, start_frame_idx + i, 
+                                 transformation, frame_timestamp)
 
     # Block on processing of final frame so that latencies include all frames
     # processed.
@@ -179,7 +223,7 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
 
 
 def process_videos(video_pathnames, output_filename, resources, owner_resources, 
-	sink_resources, max_frames, num_sinks, view=False):
+	sink_resources, max_frames, num_sinks, simulate_failure=False, view=False):
     # Set up sinks. 
     signal = SignalActor.remote(len(video_pathnames))
     ray.get(signal.ready.remote())
@@ -202,7 +246,7 @@ def process_videos(video_pathnames, output_filename, resources, owner_resources,
 
     # TODO what is start_timestamp? Start of processing or start of video?
     # Give the actors some time to start up.
-    start_timestamp = time.time() + 5
+    start_timestamp = time.time() # + 5
 
     # Process each video.
     for i, video_pathname in enumerate(video_pathnames):
@@ -215,7 +259,8 @@ def process_videos(video_pathnames, output_filename, resources, owner_resources,
         process_chunk.options(resources={owner_resource: 1}).remote( 
                 i, video_pathnames[i],
                 sinks[i % len(sinks)], num_total_frames,
-                int(fps), worker_resource, start_timestamp)
+                int(fps), worker_resource, start_timestamp,
+                simulate_failure)
 
     # Wait for all videos to finish processing.
     ray.get(signal.wait.remote())
@@ -309,7 +354,7 @@ def main(args):
             worker_ip = node["NodeManagerAddress"]
     process_videos(args.video_path, args.output,
             video_resources, owner_resources, sink_resources, args.max_frames,
-            args.num_sinks, view=args.view)
+            args.num_sinks, simulate_failure=args.failure, view=args.view)
 
 
 if __name__ == "__main__":
@@ -321,7 +366,6 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str)
     parser.add_argument("--local", action="store_true")
     parser.add_argument("--failure", action="store_true")
-    parser.add_argument("--owner-failure", action="store_true")
     parser.add_argument("--timeline", default=None, type=str)
     parser.add_argument("--view", action="store_true")
     parser.add_argument("--max-frames", default=600, type=int)
