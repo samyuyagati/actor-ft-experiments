@@ -39,11 +39,19 @@ NUM_WORKERS_PER_VIDEO = 1
 
 # Decoder class uses OpenCV library to decode individual video frames.
 # Can be instantiated as an actor.
-@ray.remote(max_restarts=-1, max_task_retries=-1)
+# TODO: same as Resizer, see comment above resizer class.
+@ray.remote
 class Decoder:
     def __init__(self, filename, start_frame):
         self.v = cv2.VideoCapture(filename)
         self.v.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        self.start_frame_idx = 0
+        # If restarting from checkpoint
+        if os.path.exists("checkpoint.txt"):
+            print("Decoder recovering from checkpoint")
+            with open("checkpoint.txt", "r") as f:
+                self.start_frame_idx = int(f.read())
+        print("Decoder start frame idx: ", self.start_frame_idx)
 
     def decode(self, frame, frame_timestamp):
         # Simulate an incoming video stream; need to sleep to output one
@@ -61,16 +69,25 @@ class Decoder:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
         return frame
 
+    # Utility fn used to simulate failures.
+    def get_pid(self):
+        return os.getpid()
+
     # Utility function to be used with ray.get to check that
     # Decoder actor has been fully initialized.
     def ready(self):
+        print("Decoder ready")
         return
 
 
 # Resizer class uses OpenCV library to resize individual video frames.
-@ray.remote(max_restarts=-1, max_task_retries=-1)
+# TODO make max_restarts, max_task_retries parameters (L232 in Stephanie's
+# original benchmark) so they can be set depending on what kind of recovery
+# we want. 
+@ray.remote
 class Resizer:
     def __init__(self, scale_factor=0.5):
+        print("initializing resizer")
         self.scale_factor = scale_factor
         self.start_frame_idx = 0
         # If restarting from checkpoint
@@ -96,6 +113,7 @@ class Resizer:
     # Utility function to be used with ray.get to check that
     # Resizer actor has been fully initialized.
     def ready(self):
+        print("Resizer ready")
         return
 
 
@@ -160,6 +178,7 @@ class Sink:
 
         self.viewer = viewer
         self.last_view = None
+        print("initializing sink")
 
     def set_expected_frames(self, video_index, num_frames):
         self.num_frames_left[video_index] = num_frames
@@ -184,6 +203,7 @@ class Sink:
 
         # Update checkpoint
         if self.checkpoint_frequency > 0 and frame_index % self.checkpoint_frequency == 0:
+            # TODO this isn't actually overwriting??
             with open("checkpoint.txt", "w") as f:
                 f.write(str(frame_index)) 
 
@@ -205,11 +225,36 @@ class Sink:
         return 
 
 
+class FailureSimError(Exception):
+    def __init__(self, message):
+        super().__init__(message)
+
+
 @ray.remote(num_cpus=0)
 def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure=False):
+    final_frame = None
+    while not final_frame:
+        try:
+            final_frame = process_chunk_helper(video_index, video_pathname, 
+                sink, num_frames, fps,
+                resource, start_timestamp, simulate_failure)
+        except:
+            # Retry, but don't simulate failure this time.
+            final_frame = process_chunk_helper(video_index, video_pathname, 
+                sink, num_frames, fps,
+                resource, start_timestamp, False)
+            print(final_frame)
+    return final_frame 
+
+
+# Uses decoder and frame resizer to process each frame in the specified video.
+def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure):
     # Create the decoder actor.
     decoder = Decoder.remote(video_pathname, 0)
+    print("decoder init started")
     ray.get(decoder.ready.remote())
+    decoder_pid = ray.get(decoder.get_pid.remote())
+    print("Decoder PID: ", decoder_pid)
 
     # Create the frame resizing (i.e., processing) actor.
     resizer = Resizer.options(resources={resource: 1}).remote()
@@ -229,13 +274,11 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
         # start_frame_idx == 0 indicates first execution; don't want to
         # fail on re-execution.
         if simulate_failure and i == fail_point and start_frame_idx == 0:
-            print("Killing resizer")
-            os.kill(resizer_pid, signal.SIGKILL) 
-        
-        # Need to set s_f_i again because resizer actor would pick up from
-        # here on restart (I think). NO -- restarts whole submitted task,
-        # which is why we need the timestamps.
-#        start_frame_idx = ray.get(resizer.get_start_frame_idx.remote())
+            print("Killing resizer and decoder")
+            os.kill(resizer_pid, signal.SIGKILL)
+            os.kill(decoder_pid, signal.SIGKILL)
+            raise FailureSimError("Simulated failure occurred; resizer and decoder died.")
+
         frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps
 
         # Process the frame 
