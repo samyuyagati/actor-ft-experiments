@@ -43,6 +43,7 @@ NUM_WORKERS_PER_VIDEO = 1
 @ray.remote
 class Decoder:
     def __init__(self, filename, start_frame):
+        print("Starting decoder init")
         self.v = cv2.VideoCapture(filename)
         self.v.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         self.start_frame_idx = 0
@@ -71,7 +72,6 @@ class Decoder:
 
     # Utility fn used to simulate failures.
     def get_pid(self):
-        print("getting pid")
         return os.getpid()
 
     # Utility function to be used with ray.get to check that
@@ -204,7 +204,6 @@ class Sink:
 
         # Update checkpoint
         if self.checkpoint_frequency > 0 and frame_index % self.checkpoint_frequency == 0:
-            # TODO this isn't actually overwriting??
             with open("checkpoint.txt", "w") as f:
                 f.write(str(frame_index)) 
 
@@ -231,28 +230,32 @@ class FailureSimError(Exception):
         super().__init__(message)
 
 
-@ray.remote(num_cpus=0)
 def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure=False):
     success = False
-    print("processing chunk")
+    retry = False
     while not success:
         try:
-            final_frame = process_chunk_helper(video_index, video_pathname, 
-                sink, num_frames, fps,
-                resource, start_timestamp, simulate_failure)
-            success = True
+            if retry:
+                final_frame = process_chunk_helper(video_index, video_pathname, 
+                    sink, num_frames, fps,
+                    resource, start_timestamp, False)
+            else:
+                final_frame = process_chunk_helper(video_index, video_pathname, 
+                    sink, num_frames, fps,
+                    resource, start_timestamp, simulate_failure)
+            print("Final frame: ", final_frame) 
         except FailureSimError:
-            print("retrying")
             # Retry, but don't simulate failure this time.
-            final_frame = process_chunk_helper(video_index, video_pathname, 
-                sink, num_frames, fps,
-                resource, start_timestamp, False)
-            print(final_frame)
+            retry = True
+        else:
+            success = True
+    print(final_frame)
     return final_frame 
 
 
 # Uses decoder and frame resizer to process each frame in the specified video.
 def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure):
+    print("num frames", num_frames)
     # Create the decoder actor.
     decoder = Decoder.remote(video_pathname, 0)
     print("decoder init started")
@@ -274,26 +277,56 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
     fail_point = int(((num_frames - 1) - start_frame_idx) / 2)
     print("Fail point: ", fail_point)
 
-    for i in range(start_frame_idx, num_frames - 1):
-        # start_frame_idx == 0 indicates first execution; don't want to
-        # fail on re-execution.
-        if simulate_failure and i == fail_point and start_frame_idx == 0:
+    # TODO 0 was previously start_frame_idx, but that may be wrong
+    for i in range(0, num_frames - start_frame_idx - 1):
+        # Simulate failure at failure point.
+        if simulate_failure and i == fail_point:
             print("Killing resizer and decoder")
             os.kill(resizer_pid, signal.SIGKILL)
             os.kill(decoder_pid, signal.SIGKILL)
+
+            # Verify that both processes were killed.
+            verify_killed(resizer_pid, "Resizer")
+            verify_killed(decoder_pid, "Decoder")            
+
+            # Raise error to break out of loop.
             raise FailureSimError("Simulated failure occurred; resizer and decoder died.")
 
         frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps
 
-        # Process the frame 
-        frame = decoder.decode.remote(start_frame_idx + i + 1, frame_timestamp) 	
-        transformation = resizer.transformation.remote(frame)
-        final = sink.send.remote(video_index, start_frame_idx + i + 1, 
-                                 transformation, frame_timestamp)
+        # Process the frame
+#        print("Decoding frame ", start_frame_idx + i + 1) 
+        frame = ray.get(decoder.decode.remote(start_frame_idx + i + 1, frame_timestamp))	
+        transformation = ray.get(resizer.transformation.remote(frame))
+        # ^ TODO ray.get is just to see if this lets it run; shouldn't actually wait.
+        
+        # TODO this try-catch may be unnecessary; it's also useless unless
+        # the call to sink.send is synchronous.
+        try:
+            final = ray.get(sink.send.remote(video_index, start_frame_idx + i, 
+                                     transformation, frame_timestamp))
+        except ray.exceptions.RayActorError:
+            print("Resizer failed before frame was sent; waiting for restart")
 
     # Block on processing of final frame so that latencies include all frames
     # processed.
-    return ray.get(final)
+    return final
+#    return ray.get(final)
+
+
+def verify_killed(pid, name):
+    killed = False
+    while not killed:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            print("{} PID {} is unassigned".format(name, pid))
+            killed = True
+        else:
+            print("{} PID {} is in use; retrying kill".format(name, pid))
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(1)
+    return True
 
 
 def process_videos(video_pathnames, output_filename, resources, owner_resources, 
@@ -331,7 +364,7 @@ def process_videos(video_pathnames, output_filename, resources, owner_resources,
         owner_resource = owner_resources[i % len(owner_resources)]
         worker_resource = resources[i % len(resources)]
         print("Placing owner of video", i, "on node with resource", owner_resource)
-        process_chunk.options(resources={owner_resource: 1}).remote( 
+        process_chunk( 
                 i, video_pathnames[i],
                 sinks[i % len(sinks)], num_total_frames,
                 int(fps), worker_resource, start_timestamp,
