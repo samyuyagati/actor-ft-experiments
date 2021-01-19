@@ -7,6 +7,7 @@ from ray import profiling
 import ray
 import ray.cluster_utils
 import signal
+import sys
 import time
 
 from collections import defaultdict
@@ -18,7 +19,7 @@ from collections import defaultdict
 #    but max_retries = 0.
 # App-level but keep all frames: set max_retries > 0. May process out of order,
 #    but ok b/c of idempotence.
-# Checkpointing: kill all actors and restart from last frame.
+# DONE Checkpointing: kill all actors and restart from last frame.
 #    DONE fake checkpoint that just records frame number (way to sync processes)
 #    just do this at the application level (wait on Sink to see when it receives
 #    frame k and take the checkpoint to do a checkpoint every k frames) (L217 of
@@ -55,12 +56,6 @@ class Decoder:
         print("Decoder start frame idx: ", self.start_frame_idx)
 
     def decode(self, frame, frame_timestamp):
-        # Simulate an incoming video stream; need to sleep to output one
-        # frame per 1/fps seconds in order to do this.
-        diff = frame_timestamp - time.time()
-        if diff > 0:
-            time.sleep(diff)
-
         # Decode frame
         if frame != self.v.get(cv2.CAP_PROP_POS_FRAMES):
             print("next frame", frame, ", at frame", self.v.get(cv2.CAP_PROP_POS_FRAMES))
@@ -236,15 +231,18 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
     while not success:
         try:
             if retry:
-                final_frame = process_chunk_helper(video_index, video_pathname, 
+                print("RETRYING")
+                final_frame = process_chunk_helper.remote(video_index, video_pathname, 
                     sink, num_frames, fps,
                     resource, start_timestamp, False)
+                result = ray.get(final_frame)
             else:
-                final_frame = process_chunk_helper(video_index, video_pathname, 
+                final_frame = process_chunk_helper.remote(video_index, video_pathname, 
                     sink, num_frames, fps,
                     resource, start_timestamp, simulate_failure)
+                result = ray.get(final_frame)
             print("Final frame: ", final_frame) 
-        except FailureSimError:
+        except:
             # Retry, but don't simulate failure this time.
             retry = True
         else:
@@ -254,10 +252,12 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
 
 
 # Uses decoder and frame resizer to process each frame in the specified video.
+@ray.remote(max_retries=0)
 def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure):
     print("num frames", num_frames)
     # Create the decoder actor.
     decoder = Decoder.remote(video_pathname, 0)
+    print("Decoder ID: ", decoder)
     print("decoder init started")
     ray.get(decoder.ready.remote())
     decoder_pid = ray.get(decoder.get_pid.remote())
@@ -265,6 +265,7 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
 
     # Create the frame resizing (i.e., processing) actor.
     resizer = Resizer.options(resources={resource: 1}).remote()
+    print("Resizer ID: ", resizer)
     ray.get(resizer.ready.remote())
     resizer_pid = ray.get(resizer.get_pid.remote())
     print("Resizer PID: ", resizer_pid)
@@ -277,41 +278,40 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
     fail_point = int(((num_frames - 1) - start_frame_idx) / 2)
     print("Fail point: ", fail_point)
 
-    # TODO 0 was previously start_frame_idx, but that may be wrong
+    # Process each frame.
     for i in range(0, num_frames - start_frame_idx - 1):
         # Simulate failure at failure point.
         if simulate_failure and i == fail_point:
             print("Killing resizer and decoder")
-            os.kill(resizer_pid, signal.SIGKILL)
-            os.kill(decoder_pid, signal.SIGKILL)
-
-            # Verify that both processes were killed.
-            verify_killed(resizer_pid, "Resizer")
-            verify_killed(decoder_pid, "Decoder")            
-
+            sys.exit()
             # Raise error to break out of loop.
             raise FailureSimError("Simulated failure occurred; resizer and decoder died.")
 
         frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps
+        # Simulate an incoming video stream; need to sleep to output one
+        # frame per 1/fps seconds in order to do this.
+        diff = frame_timestamp - time.time()
+        if diff > 0:
+            time.sleep(diff)
 
         # Process the frame
 #        print("Decoding frame ", start_frame_idx + i + 1) 
-        frame = ray.get(decoder.decode.remote(start_frame_idx + i + 1, frame_timestamp))	
-        transformation = ray.get(resizer.transformation.remote(frame))
+        frame = decoder.decode.remote(start_frame_idx + i + 1, frame_timestamp)	
+        transformation = resizer.transformation.remote(frame)
         # ^ TODO ray.get is just to see if this lets it run; shouldn't actually wait.
         
         # TODO this try-catch may be unnecessary; it's also useless unless
         # the call to sink.send is synchronous.
         try:
-            final = ray.get(sink.send.remote(video_index, start_frame_idx + i, 
-                                     transformation, frame_timestamp))
+            final = sink.send.remote(video_index, start_frame_idx + i, 
+                                     transformation, frame_timestamp)
         except ray.exceptions.RayActorError:
             print("Resizer failed before frame was sent; waiting for restart")
 
     # Block on processing of final frame so that latencies include all frames
     # processed.
-    return final
-#    return ray.get(final)
+#    return final
+    return ray.get(final)
 
 
 def verify_killed(pid, name):
