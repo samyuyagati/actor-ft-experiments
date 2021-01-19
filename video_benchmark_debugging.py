@@ -41,7 +41,6 @@ NUM_WORKERS_PER_VIDEO = 1
 # Decoder class uses OpenCV library to decode individual video frames.
 # Can be instantiated as an actor.
 # TODO: same as Resizer, see comment above resizer class.
-@ray.remote
 class Decoder:
     def __init__(self, filename, start_frame):
         print("Starting decoder init")
@@ -55,8 +54,8 @@ class Decoder:
                 self.start_frame_idx = int(f.read())
         print("Decoder start frame idx: ", self.start_frame_idx)
 
+    # Decode frame using cv2 utilities.
     def decode(self, frame, frame_timestamp):
-        # Decode frame
         if frame != self.v.get(cv2.CAP_PROP_POS_FRAMES):
             print("next frame", frame, ", at frame", self.v.get(cv2.CAP_PROP_POS_FRAMES))
             self.v.set(cv2.CAP_PROP_POS_FRAMES, frame)
@@ -80,7 +79,6 @@ class Decoder:
 # TODO make max_restarts, max_task_retries parameters (L232 in Stephanie's
 # original benchmark) so they can be set depending on what kind of recovery
 # we want. 
-@ray.remote
 class Resizer:
     def __init__(self, scale_factor=0.5):
         print("initializing resizer")
@@ -228,16 +226,23 @@ class FailureSimError(Exception):
 def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure=False):
     success = False
     retry = False
+#    final_frame = process_chunk_helper.remote(video_index, 
+#                    video_pathname, 
+#                    sink, num_frames, fps,
+#                    resource, start_timestamp, False)
+#    ray.get(final_frame)
     while not success:
         try:
             if retry:
                 print("RETRYING")
-                final_frame = process_chunk_helper.remote(video_index, video_pathname, 
+                final_frame = process_chunk_helper.remote(video_index, 
+                    video_pathname, 
                     sink, num_frames, fps,
                     resource, start_timestamp, False)
                 result = ray.get(final_frame)
             else:
-                final_frame = process_chunk_helper.remote(video_index, video_pathname, 
+                final_frame = process_chunk_helper.remote(video_index,
+                    video_pathname, 
                     sink, num_frames, fps,
                     resource, start_timestamp, simulate_failure)
                 result = ray.get(final_frame)
@@ -253,10 +258,26 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, 
 
 # Uses decoder and frame resizer to process each frame in the specified video.
 @ray.remote(max_retries=0)
-def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure):
+def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure, recovery="checkpoint"):
     print("num frames", num_frames)
+    # Set ray remote parameters for the actors
+    # Default: checkpoint recovery/manual restart
+    cls_args = {"max_restarts": 0, "max_retries": 0}
+    if recovery == "app_lose_frames":
+        cls_args = {
+            "max_restarts": -1,
+            "max_retries": 0}
+    else: 
+        cls_args = {
+            "max_restarts": -1,
+            "max_retries": -1,
+            }
+
     # Create the decoder actor.
-    decoder = Decoder.remote(video_pathname, 0)
+    decoder_cls = ray.remote(**cls_args)(Decoder)
+    print("Made decoder cls")
+    decoder = decoder_cls.remote(video_pathname, 0)
+#    decoder = Decoder.remote(video_pathname, 0)
     print("Decoder ID: ", decoder)
     print("decoder init started")
     ray.get(decoder.ready.remote())
@@ -264,7 +285,8 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
     print("Decoder PID: ", decoder_pid)
 
     # Create the frame resizing (i.e., processing) actor.
-    resizer = Resizer.options(resources={resource: 1}).remote()
+    resizer_cls = ray.remote(**cls_args)(Resizer)
+    resizer = resizer_cls.options(resources={resource: 1}).remote()
     print("Resizer ID: ", resizer)
     ray.get(resizer.ready.remote())
     resizer_pid = ray.get(resizer.get_pid.remote())
