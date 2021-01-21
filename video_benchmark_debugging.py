@@ -111,7 +111,7 @@ class Resizer:
         return
 
 
-@ray.remote(num_cpus=0, resources={"head": 1})
+@ray.remote(num_cpus=0)
 class SignalActor:
     def __init__(self, num_events):
         self.ready_event = asyncio.Event()
@@ -131,7 +131,7 @@ class SignalActor:
         return
 
 
-@ray.remote(num_cpus=0, resources={"head": 1})
+@ray.remote(num_cpus=0)
 class Viewer:
     def __init__(self, video_pathname):
 #	self.out = cv2.VideoWriter(output_path,cv2.VideoWriter_fourcc('M','J','P','G'), fps, (width,height))
@@ -167,7 +167,7 @@ class Sink:
     def __init__(self, signal, viewer, checkpoint_frequency=0):
         self.signal = signal
         self.num_frames_left = {}
-        self.latencies = defaultdict(list)
+        self.latencies = defaultdict(dict)
         self.checkpoint_frequency = checkpoint_frequency
 
         self.viewer = viewer
@@ -179,17 +179,17 @@ class Sink:
 
     def send(self, video_index, frame_index, transform, timestamp):
         with ray.profiling.profile("Sink.send"):
-            if frame_index < len(self.latencies[video_index]):
+            # Duplicate frame.
+            if frame_index in self.latencies[video_index]:
+                print("Received duplicate frame ", frame_index)
                 return
-            assert frame_index == len(self.latencies[video_index]), frame_index
+            # Record latency.
+            self.latencies[video_index][frame_index] = time.time() - timestamp
 
-            self.latencies[video_index].append(time.time() - timestamp)
+            if frame_index % 100 == 0:
+                print("Expecting", self.num_frames_left[video_index] - frame_index, "more frames from video", video_index)
 
-            self.num_frames_left[video_index] -= 1
-            if self.num_frames_left[video_index] % 100 == 0:
-                print("Expecting", self.num_frames_left[video_index], "more frames from video", video_index)
-
-            if self.num_frames_left[video_index] == 0:
+            if frame_index == self.num_frames_left[video_index] - 1:
                 print("DONE")
                 if self.last_view is not None:
                     ray.get(self.last_view)
@@ -208,8 +208,8 @@ class Sink:
     def latencies(self):
         latencies = []
         for video in self.latencies.values():
-            for i, l in enumerate(video):
-                latencies.append((i, l))
+            for i in sorted(video.keys()):
+                latencies.append((i, video[i]))
         return latencies
 
 
@@ -224,13 +224,25 @@ class FailureSimError(Exception):
 
 
 def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure=False, recovery="checkpoint"):
-    success = False
-    retry = False
-    final_frame = process_chunk_helper.remote(video_index, 
-                    video_pathname, 
-                    sink, num_frames, fps,
-                    resource, start_timestamp, True, recovery=recovery)
-    ray.get(final_frame)
+    if recovery == "checkpoint":
+        try:
+            final_frame = process_chunk_helper.remote(video_index, 
+                            video_pathname, 
+                            sink, num_frames, fps,
+                            resource, start_timestamp, True, recovery=recovery)
+            ray.get(final_frame)
+        except ray.exceptions.WorkerCrashedError:
+            final_frame = process_chunk_helper.remote(video_index, 
+                            video_pathname, 
+                            sink, num_frames, fps,
+                            resource, start_timestamp, False, recovery=recovery)
+            ray.get(final_frame)
+    else:
+        final_frame = process_chunk_helper.remote(video_index, 
+                        video_pathname, 
+                        sink, num_frames, fps,
+                        resource, start_timestamp, True, recovery=recovery)
+        ray.get(final_frame)
 #    while not success:
 #        try:
 #            if retry:
@@ -263,15 +275,15 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
     print("num frames", num_frames)
     # Set ray remote parameters for the actors
     # Default: checkpoint recovery/manual restart
-    cls_args = {"max_restarts": 0, "max_retries": 0}
+    cls_args = {"max_restarts": 0, "max_task_retries": 0}
     if recovery == "app_lose_frames":
         cls_args = {
             "max_restarts": -1,
-            "max_retries": 0}
+            "max_task_retries": 0}
     else: 
         cls_args = {
             "max_restarts": -1,
-            "max_retries": -1,
+            "max_task_retries": -1,
             }
 
     # Create the decoder actor.
@@ -286,7 +298,7 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
 
     # Create the frame resizing (i.e., processing) actor.
     resizer_cls = ray.remote(**cls_args)(Resizer)
-    resizer = resizer_cls.options(resources={resource: 1}).remote()
+    resizer = resizer_cls.remote()
     print("Resizer ID: ", resizer)
     ray.get(resizer.ready.remote())
     resizer_pid = ray.get(resizer.get_pid.remote())
@@ -331,7 +343,7 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
 
     # Block on processing of final frame so that latencies include all frames
     # processed.
-    return ray.get(final)
+    ray.wait([final], num_returns=1)
 
 
 def verify_killed(pid, name):
@@ -360,9 +372,7 @@ def process_videos(video_pathnames, output_filename, resources, owner_resources,
     if view:
         viewer = Viewer.remote(video_pathnames[0])
 
-    sinks = [Sink.options(resources={
-        sink_resources[i % len(sink_resources)]: 1
-        }).remote(signal, viewer, checkpoint_frequency) for i in range(num_sinks)]
+    sinks = [Sink.remote(signal, viewer, checkpoint_frequency) for i in range(num_sinks)]
     ray.get([sink.ready.remote() for sink in sinks])
 
     for i, video_pathname in enumerate(video_pathnames):
@@ -396,7 +406,17 @@ def process_videos(video_pathnames, output_filename, resources, owner_resources,
     # Calculate latencies.
     latencies = []
     for sink in sinks:
-        latencies += ray.get(sink.latencies.remote())
+        sink_latencies = ray.get(sink.latencies.remote())
+        latencies += sink_latencies
+
+        j = 0
+        for i, _ in latencies:
+            if i != j:
+                print("Sink missing frame", j)
+                j = i
+            j += 1
+
+    output_filename = "{}.txt".format(recovery)
     if output_filename:
         with open(output_filename, 'w') as f:
             for t, l in latencies:
@@ -427,7 +447,9 @@ def main(args):
     if args.local:
         cluster = ray.cluster_utils.Cluster()
         # Create head node.
-        cluster.add_node(num_cpus=0, resources={"head": 100})
+        cluster.add_node(num_cpus=0, resources={"head": 100}, _system_config={
+            "task_retry_delay_ms": 100,
+            })
         # Add remaining nodes.
         for _ in range(args.num_nodes):
             cluster.add_node()
@@ -446,10 +468,10 @@ def main(args):
 
     # TODO add in non-local
 
-    for node in nodes:
-        for resource in node["Resources"]:
-            if resource.startswith("video"):
-                ray.experimental.set_resource(resource, 0, node["NodeID"])
+    #for node in nodes:
+    #    for resource in node["Resources"]:
+    #        if resource.startswith("video"):
+    #            ray.experimental.set_resource(resource, 0, node["NodeID"])
 
     nodes = [node for node in ray.nodes() if node["Alive"]]
     print("All nodes joined")
@@ -471,8 +493,8 @@ def main(args):
         if "CPU" not in node["Resources"]:
             continue
 
-        print("Assigning", resource, "to node", node["NodeID"], node["Resources"])
-        ray.experimental.set_resource(resource, 100, node["NodeID"])
+        #print("Assigning", resource, "to node", node["NodeID"], node["Resources"])
+        #ray.experimental.set_resource(resource, 100, node["NodeID"])
 
         if "owner" in resource:
             owner_resource = resource

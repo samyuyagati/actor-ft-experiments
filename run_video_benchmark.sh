@@ -12,14 +12,17 @@
 # ----- Run benchmarks -----
 # Simulate one failure about halfway through processing and with
 # simulated application-level recovery that tolerates missing frames.
-python3 video_benchmark_debugging.py --local --output app_lose_frames_timeline.txt --num-nodes 3 --video-path videos/husky.mp4 --failure --recovery app_lose_frames
+rm checkpoint.txt || true
+python3 video_benchmark_debugging.py --local --num-nodes 3 --video-path videos/husky.mp4 --failure --recovery app_lose_frames
 
 # Simulate one failure about halfway through processing and with
 # simulated application-level recovery that does not allow missing frames.
-python3 video_benchmark_debugging.py --local --output app_keep_frames_timeline.txt --num-nodes 3 --video-path videos/husky.mp4 --failure --recovery app_keep_frames
+rm checkpoint.txt || true
+python3 video_benchmark_debugging.py --local --num-nodes 3 --video-path videos/husky.mp4 --failure --recovery app_keep_frames
 
 # Simulate one failure about halfway through processing and with
 # simulated global checkpointing for recovery. To vary the checkpoint frequency,
 # simply specify a different number with the checkpoint-freq flag (the
 # command below sets it to one checkpoint per ten frames processed).
-python3 video_benchmark_debugging.py --local --output checkpoint_timeline.txt --num-nodes 3 --video-path videos/husky.mp4 --failure --checkpoint-freq 10 --recovery checkpoint
+rm checkpoint.txt || true
+python3 video_benchmark_debugging.py --local --num-nodes 3 --video-path videos/husky.mp4 --failure --checkpoint-freq 10 --recovery checkpoint
