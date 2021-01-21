@@ -178,6 +178,11 @@ class Sink:
         self.num_frames_left[video_index] = num_frames
 
     def send(self, video_index, frame_index, transform, timestamp):
+        # Update checkpoint
+        if self.checkpoint_frequency > 0 and frame_index % self.checkpoint_frequency == 0:
+            with open("checkpoint.txt", "w") as f:
+                f.write(str(frame_index)) 
+
         with ray.profiling.profile("Sink.send"):
             # Duplicate frame.
             if frame_index in self.latencies[video_index]:
@@ -189,27 +194,23 @@ class Sink:
             if frame_index % 100 == 0:
                 print("Expecting", self.num_frames_left[video_index] - frame_index, "more frames from video", video_index)
 
+	    # Only view the first video to check for correctness.
+            if self.viewer is not None and video_index == 0:
+                self.last_view = self.viewer.send.remote(transform)
+
             if frame_index == self.num_frames_left[video_index] - 1:
                 print("DONE")
                 if self.last_view is not None:
                     ray.get(self.last_view)
                 self.signal.send.remote()
 
-        # Update checkpoint
-        if self.checkpoint_frequency > 0 and frame_index % self.checkpoint_frequency == 0:
-            with open("checkpoint.txt", "w") as f:
-                f.write(str(frame_index)) 
-
-	    # Only view the first video to check for correctness.
-            if self.viewer is not None and video_index == 0:
-                self.last_view = self.viewer.send.remote(transform)
-
 
     def latencies(self):
         latencies = []
-        for video in self.latencies.values():
+        for video_index in sorted(self.latencies.keys()):
+            video = self.latencies[video_index]
             for i in sorted(video.keys()):
-                latencies.append((i, video[i]))
+                latencies.append((video_index, i, video[i]))
         return latencies
 
 
@@ -223,55 +224,34 @@ class FailureSimError(Exception):
         super().__init__(message)
 
 
-def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure=False, recovery="checkpoint"):
+@ray.remote
+def process_chunk(video_index, video_pathname, sink, num_frames, fps, start_timestamp, simulate_failure=False, recovery="checkpoint"):
     if recovery == "checkpoint":
         try:
             final_frame = process_chunk_helper.remote(video_index, 
                             video_pathname, 
                             sink, num_frames, fps,
-                            resource, start_timestamp, True, recovery=recovery)
+                            start_timestamp, simulate_failure, recovery=recovery)
             ray.get(final_frame)
         except ray.exceptions.WorkerCrashedError:
             final_frame = process_chunk_helper.remote(video_index, 
                             video_pathname, 
                             sink, num_frames, fps,
-                            resource, start_timestamp, False, recovery=recovery)
+                            start_timestamp, False, recovery=recovery)
             ray.get(final_frame)
     else:
         final_frame = process_chunk_helper.remote(video_index, 
                         video_pathname, 
                         sink, num_frames, fps,
-                        resource, start_timestamp, True, recovery=recovery)
+                        start_timestamp, simulate_failure, recovery=recovery)
         ray.get(final_frame)
-#    while not success:
-#        try:
-#            if retry:
-#                print("RETRYING")
-#                final_frame = process_chunk_helper.remote(video_index, 
-#                    video_pathname, 
-#                    sink, num_frames, fps,
-#                    resource, start_timestamp, False, recovery=recovery)
-#                result = ray.get(final_frame)
-#            else:
-#                final_frame = process_chunk_helper.remote(video_index,
-#                    video_pathname, 
-#                    sink, num_frames, fps,
-#                    resource, start_timestamp, simulate_failure,
-#                    recovery=recovery)
-#                result = ray.get(final_frame)
-#            print("Final frame: ", final_frame) 
-#        except:
-#            # Retry, but don't simulate failure this time.
-#            retry = True
-#        else:
-#            success = True
     print(final_frame)
     return final_frame 
 
 
 # Uses decoder and frame resizer to process each frame in the specified video.
 @ray.remote(max_retries=0)
-def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure, recovery="checkpoint"):
+def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, start_timestamp, simulate_failure, recovery="checkpoint"):
     print("num frames", num_frames)
     # Set ray remote parameters for the actors
     # Default: checkpoint recovery/manual restart
@@ -309,7 +289,7 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
     print("Start frame idx: ", start_frame_idx)
 
     # If failure simulation: determine point to fail
-    fail_point = int(((num_frames - 1) - start_frame_idx) / 2)
+    fail_point = (num_frames - start_frame_idx) // 2 + 15
     print("Fail point: ", fail_point)
 
     # Process each frame.
@@ -323,9 +303,7 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
                 raise FailureSimError("Simulated failure occurred; resizer and decoder died.")
             else:
                 os.kill(resizer_pid, signal.SIGKILL)
-                os.kill(decoder_pid, signal.SIGKILL)
-                verify_killed(resizer_pid, "Resizer")
-                verify_killed(decoder_pid, "Decoder")
+                #verify_killed(resizer_pid, "Resizer")
 
         # Calculate frame timestamp
         frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps
@@ -361,8 +339,7 @@ def verify_killed(pid, name):
     return True
 
 
-def process_videos(video_pathnames, output_filename, resources, owner_resources, 
-	sink_resources, max_frames, num_sinks, checkpoint_frequency, 
+def process_videos(video_pathnames, max_frames, num_sinks, checkpoint_frequency, 
     simulate_failure=False, recovery="checkpoint", view=False):
     # Set up sinks. 
     signal = SignalActor.remote(len(video_pathnames))
@@ -382,23 +359,19 @@ def process_videos(video_pathnames, output_filename, resources, owner_resources,
         print(video_pathname, "FRAMES", num_total_frames)
         ray.get(sinks[i % len(sinks)].set_expected_frames.remote(i, num_total_frames - 1))
 
-    # TODO what is start_timestamp? Start of processing or start of video?
     # Give the actors some time to start up.
-    start_timestamp = time.time() # + 5
+    start_timestamp = time.time() + 5
 
     # Process each video.
     for i, video_pathname in enumerate(video_pathnames):
         v = cv2.VideoCapture(video_pathname)
         num_total_frames = int(min(v.get(cv2.CAP_PROP_FRAME_COUNT), max_frames))
         fps = v.get(cv2.CAP_PROP_FPS)
-        owner_resource = owner_resources[i % len(owner_resources)]
-        worker_resource = resources[i % len(resources)]
-        print("Placing owner of video", i, "on node with resource", owner_resource)
-        process_chunk( 
+        process_chunk.remote( 
                 i, video_pathnames[i],
                 sinks[i % len(sinks)], num_total_frames,
-                int(fps), worker_resource, start_timestamp,
-                simulate_failure, recovery=recovery)
+                int(fps), start_timestamp,
+                simulate_failure if i == 0 else False, recovery=recovery)
 
     # Wait for all videos to finish processing.
     ray.get(signal.wait.remote())
@@ -410,116 +383,45 @@ def process_videos(video_pathnames, output_filename, resources, owner_resources,
         latencies += sink_latencies
 
         j = 0
-        for i, _ in latencies:
+        for video_index, i, _ in latencies:
             if i != j:
-                print("Sink missing frame", j)
+                print("Sink missing frame", j, "for video", video_index)
                 j = i
             j += 1
 
     output_filename = "{}.txt".format(recovery)
-    if output_filename:
-        with open(output_filename, 'w') as f:
-            for t, l in latencies:
-                f.write("{} {}\n".format(t, l))
-    else:
-        for latency in latencies:
-            print(latency)
-    latencies = [l for _, l in latencies]
+    with open(output_filename, 'w') as f:
+        for i, t, l in latencies:
+            f.write("{} {} {}\n".format(i, t, l))
+    latencies = [l for _, _, l in latencies]
     print("Mean latency:", np.mean(latencies))
     print("Max latency:", np.max(latencies))
 
 
 def main(args):
-    video_resources = ["video:{}".format(i) for i in range(len(args.video_path))]
-
-    num_owner_nodes = len(args.video_path) // args.num_owners_per_node
-    if len(args.video_path) % args.num_owners_per_node:
-        num_owner_nodes += 1
-    owner_resources = ["video_owner:{}".format(i) for i in range(num_owner_nodes)]
-
-    num_sink_nodes = len(video_resources) # For now, one sink per video. 
-    sink_resources = ["video_sink:{}".format(i) for i in range(num_sink_nodes)]
-    
-    num_required_nodes = len(args.video_path) + num_owner_nodes + num_sink_nodes
-    assert args.num_nodes >= num_required_nodes, ("Requested {} nodes, need {}".format(args.num_nodes, num_required_nodes)) 
-
-    # Just do local for now, add remote later.
-    if args.local:
-        cluster = ray.cluster_utils.Cluster()
-        # Create head node.
-        cluster.add_node(num_cpus=0, resources={"head": 100}, _system_config={
+    ray.init(_system_config={
             "task_retry_delay_ms": 100,
             })
-        # Add remaining nodes.
-        for _ in range(args.num_nodes):
-            cluster.add_node()
-        cluster.wait_for_nodes()
-        address = cluster.address
-    else:
-        address = "auto"
 
-    ray.init(address=address)
+    # Delete checkpoint file to have a clean start.
+    if os.path.exists("checkpoint.txt"):
+        os.remove("checkpoint.txt")
 
-    nodes = [node for node in ray.nodes() if node["Alive"]]
-    while len(nodes) < args.num_nodes + 1:
-        time.sleep(1)
-        print("{} nodes found, waiting for nodes to join".format(len(nodes)))
-        nodes = [node for node in ray.nodes() if node["Alive"]]
-
-    # TODO add in non-local
-
-    #for node in nodes:
-    #    for resource in node["Resources"]:
-    #        if resource.startswith("video"):
-    #            ray.experimental.set_resource(resource, 0, node["NodeID"])
-
-    nodes = [node for node in ray.nodes() if node["Alive"]]
-    print("All nodes joined")
-    for node in nodes:
-        print("{}:{}".format(node["NodeManagerAddress"], node["NodeManagerPort"]))
-
-    head_node = [node for node in nodes if "head" in node["Resources"]]
-    assert len(head_node) == 1
-    head_ip = head_node[0]["NodeManagerAddress"]
-    nodes.remove(head_node[0])
-    assert len(nodes) >= len(video_resources) + num_owner_nodes, ("Found {} nodes, need {}".format(len(nodes), len(video_resources) + num_owner_nodes))
-
-    worker_ip = None
-    worker_resource = None
-    owner_ip = None
-    owner_resource = None
-    node_index = 0
-    for node, resource in zip(nodes, sink_resources + owner_resources + video_resources):
-        if "CPU" not in node["Resources"]:
-            continue
-
-        #print("Assigning", resource, "to node", node["NodeID"], node["Resources"])
-        #ray.experimental.set_resource(resource, 100, node["NodeID"])
-
-        if "owner" in resource:
-            owner_resource = resource
-            owner_ip = node["NodeManagerAddress"]
-        elif "video:" in resource:
-            worker_resource = resource
-            worker_ip = node["NodeManagerAddress"]
-    process_videos(args.video_path, args.output,
-            video_resources, owner_resources, sink_resources, args.max_frames,
+    process_videos(args.video_path,
+            args.max_frames,
             args.num_sinks, args.checkpoint_freq,
             simulate_failure=args.failure, recovery=args.recovery_type,
             view=args.view)
-    # Delete checkpoint file to have a clean start next run.
-    if os.path.exists("checkpoint.txt"):
-        os.remove("checkpoint.txt")
+
+    if args.timeline:
+        ray.timeline(filename="{}.json".format(args.recovery))
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Run the video benchmark.")
 
-    parser.add_argument("--num-nodes", required=True, type=int)
     parser.add_argument("--video-path", required=True, nargs='+', type=str)
-    parser.add_argument("--output", type=str)
-    parser.add_argument("--local", action="store_true")
     parser.add_argument("--failure", action="store_true")
     parser.add_argument("--timeline", default=None, type=str)
     parser.add_argument("--view", action="store_true")
