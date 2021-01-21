@@ -223,35 +223,36 @@ class FailureSimError(Exception):
         super().__init__(message)
 
 
-def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure=False):
+def process_chunk(video_index, video_pathname, sink, num_frames, fps, resource, start_timestamp, simulate_failure=False, recovery="checkpoint"):
     success = False
     retry = False
-#    final_frame = process_chunk_helper.remote(video_index, 
+    final_frame = process_chunk_helper.remote(video_index, 
+                    video_pathname, 
+                    sink, num_frames, fps,
+                    resource, start_timestamp, True, recovery=recovery)
+    ray.get(final_frame)
+#    while not success:
+#        try:
+#            if retry:
+#                print("RETRYING")
+#                final_frame = process_chunk_helper.remote(video_index, 
 #                    video_pathname, 
 #                    sink, num_frames, fps,
-#                    resource, start_timestamp, False)
-#    ray.get(final_frame)
-    while not success:
-        try:
-            if retry:
-                print("RETRYING")
-                final_frame = process_chunk_helper.remote(video_index, 
-                    video_pathname, 
-                    sink, num_frames, fps,
-                    resource, start_timestamp, False)
-                result = ray.get(final_frame)
-            else:
-                final_frame = process_chunk_helper.remote(video_index,
-                    video_pathname, 
-                    sink, num_frames, fps,
-                    resource, start_timestamp, simulate_failure)
-                result = ray.get(final_frame)
-            print("Final frame: ", final_frame) 
-        except:
-            # Retry, but don't simulate failure this time.
-            retry = True
-        else:
-            success = True
+#                    resource, start_timestamp, False, recovery=recovery)
+#                result = ray.get(final_frame)
+#            else:
+#                final_frame = process_chunk_helper.remote(video_index,
+#                    video_pathname, 
+#                    sink, num_frames, fps,
+#                    resource, start_timestamp, simulate_failure,
+#                    recovery=recovery)
+#                result = ray.get(final_frame)
+#            print("Final frame: ", final_frame) 
+#        except:
+#            # Retry, but don't simulate failure this time.
+#            retry = True
+#        else:
+#            success = True
     print(final_frame)
     return final_frame 
 
@@ -277,7 +278,6 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
     decoder_cls = ray.remote(**cls_args)(Decoder)
     print("Made decoder cls")
     decoder = decoder_cls.remote(video_pathname, 0)
-#    decoder = Decoder.remote(video_pathname, 0)
     print("Decoder ID: ", decoder)
     print("decoder init started")
     ray.get(decoder.ready.remote())
@@ -305,10 +305,17 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
         # Simulate failure at failure point.
         if simulate_failure and i == fail_point:
             print("Killing resizer and decoder")
-            sys.exit()
-            # Raise error to break out of loop.
-            raise FailureSimError("Simulated failure occurred; resizer and decoder died.")
+            if recovery == "checkpoint":
+                sys.exit()
+                # Raise error to break out of loop.
+                raise FailureSimError("Simulated failure occurred; resizer and decoder died.")
+            else:
+                os.kill(resizer_pid, signal.SIGKILL)
+                os.kill(decoder_pid, signal.SIGKILL)
+                verify_killed(resizer_pid, "Resizer")
+                verify_killed(decoder_pid, "Decoder")
 
+        # Calculate frame timestamp
         frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps
         # Simulate an incoming video stream; need to sleep to output one
         # frame per 1/fps seconds in order to do this.
@@ -317,22 +324,13 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, res
             time.sleep(diff)
 
         # Process the frame
-#        print("Decoding frame ", start_frame_idx + i + 1) 
         frame = decoder.decode.remote(start_frame_idx + i + 1, frame_timestamp)	
         transformation = resizer.transformation.remote(frame)
-        # ^ TODO ray.get is just to see if this lets it run; shouldn't actually wait.
-        
-        # TODO this try-catch may be unnecessary; it's also useless unless
-        # the call to sink.send is synchronous.
-        try:
-            final = sink.send.remote(video_index, start_frame_idx + i, 
-                                     transformation, frame_timestamp)
-        except ray.exceptions.RayActorError:
-            print("Resizer failed before frame was sent; waiting for restart")
+        final = sink.send.remote(video_index, start_frame_idx + i, 
+                                 transformation, frame_timestamp)
 
     # Block on processing of final frame so that latencies include all frames
     # processed.
-#    return final
     return ray.get(final)
 
 
@@ -353,7 +351,7 @@ def verify_killed(pid, name):
 
 def process_videos(video_pathnames, output_filename, resources, owner_resources, 
 	sink_resources, max_frames, num_sinks, checkpoint_frequency, 
-    simulate_failure=False, view=False):
+    simulate_failure=False, recovery="checkpoint", view=False):
     # Set up sinks. 
     signal = SignalActor.remote(len(video_pathnames))
     ray.get(signal.ready.remote())
@@ -390,7 +388,7 @@ def process_videos(video_pathnames, output_filename, resources, owner_resources,
                 i, video_pathnames[i],
                 sinks[i % len(sinks)], num_total_frames,
                 int(fps), worker_resource, start_timestamp,
-                simulate_failure)
+                simulate_failure, recovery=recovery)
 
     # Wait for all videos to finish processing.
     ray.get(signal.wait.remote())
@@ -485,7 +483,8 @@ def main(args):
     process_videos(args.video_path, args.output,
             video_resources, owner_resources, sink_resources, args.max_frames,
             args.num_sinks, args.checkpoint_freq,
-            simulate_failure=args.failure, view=args.view)
+            simulate_failure=args.failure, recovery=args.recovery_type,
+            view=args.view)
     # Delete checkpoint file to have a clean start next run.
     if os.path.exists("checkpoint.txt"):
         os.remove("checkpoint.txt")
@@ -507,5 +506,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-owners-per-node", default=1, type=int)
     parser.add_argument("--centralized", action="store_true")
     parser.add_argument("--checkpoint-freq", default=0, type=int)
+    # Options: "checkpoint", "app_lose_frames", "app_keep_frames"
+    parser.add_argument("--recovery-type", default="checkpoint", type=str)
     args = parser.parse_args()
     main(args)
