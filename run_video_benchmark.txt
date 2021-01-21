@@ -1,0 +1,6 @@
+1) Run on stable installation of Ray (pip install -U ray)
+2) ./run_video_benchmark.sh to run benchmark with three recovery modes: checkpoint (checkpointing once per 10 frames), simulated app-level recovery that allows missing frames, and simulated app-level recovery that does not allow missing frames.
+-- Outputs are written to checkpoint_timeline.txt, app_lose_frames_timeline.txt,
+   and app_keep_frames_timeline.txt respectively.
+-- Output format: each line has the frame and latency in seconds, separated by a
+   space.
