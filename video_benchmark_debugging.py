@@ -389,7 +389,7 @@ def process_videos(video_pathnames, max_frames, num_sinks, checkpoint_frequency,
                 j = i
             j += 1
 
-    output_filename = "{}{}.txt".format(recovery, "-failure" if simulate_failure else "")
+    output_filename = "{}-output{}.txt".format(recovery, "-failure" if simulate_failure else "")
     with open(output_filename, 'w') as f:
         for i, t, l in latencies:
             f.write("{} {} {}\n".format(i, t, l))
