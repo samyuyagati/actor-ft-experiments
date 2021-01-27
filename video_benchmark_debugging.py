@@ -12,6 +12,11 @@ import time
 
 from collections import defaultdict
 
+LOG = "log"
+CHECKPOINT = "checkpoint"
+APP_KEEP_FRAMES = "app_keep_frames"
+APP_LOSE_FRAMES = "app_lose_frames"
+
 # Application-level semantics: drops some frames in the middle (skip failed
 #    frame; Sink gets error but ignore it and keep executing). Default should be
 #    to not retry tasks, so there should just be an error. Should work out of
@@ -48,9 +53,9 @@ class Decoder:
         self.v.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         self.start_frame_idx = 0
         # If restarting from checkpoint
-        if os.path.exists("checkpoint.txt"):
+        if os.path.exists("/tmp/ray/session_latest/logs/checkpoint.txt"):
             print("Decoder recovering from checkpoint")
-            with open("checkpoint.txt", "r") as f:
+            with open("/tmp/ray/session_latest/logs/checkpoint.txt", "r") as f:
                 self.start_frame_idx = int(f.read())
         print("Decoder start frame idx: ", self.start_frame_idx)
 
@@ -85,17 +90,15 @@ class Resizer:
         self.scale_factor = scale_factor
         self.start_frame_idx = 0
         # If restarting from checkpoint
-        if os.path.exists("checkpoint.txt"):
+        if os.path.exists("/tmp/ray/session_latest/logs/checkpoint.txt"):
             print("Resizer recovering from checkpoint")
-            with open("checkpoint.txt", "r") as f:
+            with open("/tmp/ray/session_latest/logs/checkpoint.txt", "r") as f:
                 self.start_frame_idx = int(f.read())
         print("Resizer start frame idx: ", self.start_frame_idx)
 
-    def transformation(self, frame):
+    def transform(self, frame):
         with ray.profiling.profile("resize"):
-            new_width = int(self.scale_factor * frame.shape[1])
-            new_height = int(self.scale_factor * frame.shape[0])
-            return (new_width, new_height)
+            return cv2.GaussianBlur(frame, (25, 25), 0)
 
     def get_start_frame_idx(self):
         return self.start_frame_idx
@@ -138,22 +141,12 @@ class Viewer:
         self.video_pathname = video_pathname
         self.v = cv2.VideoCapture(video_pathname)
 
-    def send(self, transformation):
+    def send(self, frame_out):
         success, frame = self.v.read()
         assert success
-        resized = cv2.resize(frame, transformation, interpolation=cv2.INTER_AREA)
-
-        # Pad resized image so it can be concatenated w/ original
-        top_padding = int((frame.shape[0] - resized.shape[0]) / 2)
-        bottom_padding = frame.shape[0] - top_padding - resized.shape[0]
-        left_padding = int((frame.shape[1] - resized.shape[1]) / 2)
-        right_padding = frame.shape[1] - left_padding - resized.shape[1]
-        resized_padded = cv2.copyMakeBorder(resized, top_padding,
-                bottom_padding, left_padding, right_padding,
-                borderType=cv2.BORDER_CONSTANT)
 
         # Generate concatenated output frame.
-        frame_out = cv2.hconcat([frame, resized_padded])
+        frame_out = cv2.hconcat([frame, frame_out])
         cv2.imshow("Before and After", frame_out)
         cv2.waitKey(1) # Leave image up until user presses a key.
 
@@ -180,8 +173,10 @@ class Sink:
     def send(self, video_index, frame_index, transform, timestamp):
         # Update checkpoint
         if self.checkpoint_frequency > 0 and frame_index % self.checkpoint_frequency == 0:
-            with open("checkpoint.txt", "w") as f:
+            with open("/tmp/ray/session_latest/logs/checkpoint.txt", "w") as f:
                 f.write(str(frame_index)) 
+            with open("/tmp/ray/session_latest/logs/checkpoint_time.txt", "w") as f:
+                f.write(str(int(time.time() * 1000)))
 
         with ray.profiling.profile("Sink.send"):
             # Duplicate frame.
@@ -219,14 +214,9 @@ class Sink:
         return 
 
 
-class FailureSimError(Exception):
-    def __init__(self, message):
-        super().__init__(message)
-
-
 @ray.remote
-def process_chunk(video_index, video_pathname, sink, num_frames, fps, start_timestamp, simulate_failure=False, recovery="checkpoint"):
-    if recovery == "checkpoint":
+def process_chunk(video_index, video_pathname, sink, num_frames, fps, start_timestamp, simulate_failure=False, recovery=CHECKPOINT):
+    if recovery == CHECKPOINT:
         try:
             final_frame = process_chunk_helper.remote(video_index, 
                             video_pathname, 
@@ -251,16 +241,16 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, start_time
 
 # Uses decoder and frame resizer to process each frame in the specified video.
 @ray.remote(max_retries=0)
-def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, start_timestamp, simulate_failure, recovery="checkpoint"):
+def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, start_timestamp, simulate_failure, recovery=CHECKPOINT):
     print("num frames", num_frames)
     # Set ray remote parameters for the actors
     # Default: checkpoint recovery/manual restart
     cls_args = {"max_restarts": 0, "max_task_retries": 0}
-    if recovery == "app_lose_frames":
+    if recovery == APP_LOSE_FRAMES:
         cls_args = {
             "max_restarts": -1,
             "max_task_retries": 0}
-    else: 
+    elif recovery == APP_KEEP_FRAMES or recovery == LOG:
         cls_args = {
             "max_restarts": -1,
             "max_task_retries": -1,
@@ -297,10 +287,8 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, sta
         # Simulate failure at failure point.
         if simulate_failure and i == fail_point:
             print("Killing resizer and decoder")
-            if recovery == "checkpoint":
+            if recovery == CHECKPOINT:
                 sys.exit()
-                # Raise error to break out of loop.
-                raise FailureSimError("Simulated failure occurred; resizer and decoder died.")
             else:
                 os.kill(resizer_pid, signal.SIGKILL)
                 #verify_killed(resizer_pid, "Resizer")
@@ -315,7 +303,7 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, sta
 
         # Process the frame
         frame = decoder.decode.remote(start_frame_idx + i + 1, frame_timestamp)	
-        transformation = resizer.transformation.remote(frame)
+        transformation = resizer.transform.remote(frame)
         final = sink.send.remote(video_index, start_frame_idx + i, 
                                  transformation, frame_timestamp)
 
@@ -340,7 +328,7 @@ def verify_killed(pid, name):
 
 
 def process_videos(video_pathnames, max_frames, num_sinks, checkpoint_frequency, 
-    simulate_failure=False, recovery="checkpoint", view=False):
+    simulate_failure=False, recovery=CHECKPOINT, view=False):
     # Set up sinks. 
     signal = SignalActor.remote(len(video_pathnames))
     ray.get(signal.ready.remote())
@@ -399,13 +387,12 @@ def process_videos(video_pathnames, max_frames, num_sinks, checkpoint_frequency,
 
 
 def main(args):
-    ray.init(_system_config={
+    system_config = {
             "task_retry_delay_ms": 100,
-            })
-
-    # Delete checkpoint file to have a clean start.
-    if os.path.exists("checkpoint.txt"):
-        os.remove("checkpoint.txt")
+            }
+    if args.recovery_type == LOG:
+        system_config["logging_enabled"] = True
+    ray.init(_system_config=system_config)
 
     process_videos(args.video_path,
             args.max_frames,
@@ -431,6 +418,9 @@ if __name__ == "__main__":
     parser.add_argument("--centralized", action="store_true")
     parser.add_argument("--checkpoint-freq", default=0, type=int)
     # Options: "checkpoint", "app_lose_frames", "app_keep_frames"
-    parser.add_argument("--recovery-type", default="checkpoint", type=str)
+    parser.add_argument("--recovery-type", type=str, required=True)
     args = parser.parse_args()
+
+    recovery_types = [CHECKPOINT, APP_LOSE_FRAMES, APP_KEEP_FRAMES, LOG]
+    assert args.recovery_type in recovery_types, ("Invalid recovery type, must be one of " + ", ".join(recovery_types))
     main(args)
