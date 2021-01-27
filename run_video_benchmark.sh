@@ -26,3 +26,6 @@ python3 video_benchmark_debugging.py --video-path videos/husky.mp4 --failure --r
 # command below sets it to one checkpoint per ten frames processed).
 python3 video_benchmark_debugging.py --video-path videos/husky.mp4 --checkpoint-freq 30 --recovery checkpoint
 python3 video_benchmark_debugging.py --video-path videos/husky.mp4 --failure --checkpoint-freq 30 --recovery checkpoint
+
+python3 video_benchmark_debugging.py --video-path videos/husky.mp4 --checkpoint-freq 30 --recovery log
+python3 video_benchmark_debugging.py --video-path videos/husky.mp4 --failure --checkpoint-freq 30 --recovery log

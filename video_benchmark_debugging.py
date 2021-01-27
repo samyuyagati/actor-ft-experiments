@@ -249,6 +249,7 @@ def process_chunk(video_index, video_pathname, sink, num_frames, fps, start_time
                             sink, num_frames, fps,
                             start_timestamp, recovery=recovery)
             ray.get(final_frame)
+            break
         except ray.exceptions.WorkerCrashedError:
             assert recovery == CHECKPOINT
 
@@ -359,15 +360,18 @@ def process_videos(video_pathnames, max_frames, num_sinks, checkpoint_frequency,
     start_timestamp = time.time() + 5
 
     # Process each video.
+    futures = []
     for i, video_pathname in enumerate(video_pathnames):
         v = cv2.VideoCapture(video_pathname)
         num_total_frames = int(min(v.get(cv2.CAP_PROP_FRAME_COUNT), max_frames))
         fps = v.get(cv2.CAP_PROP_FPS)
-        process_chunk.remote( 
+        futures.append(process_chunk.remote( 
                 i, video_pathnames[i],
                 sinks[i % len(sinks)], num_total_frames,
                 int(fps), start_timestamp,
-                simulate_failure if i == 0 else False, recovery=recovery)
+                simulate_failure if i == 0 else False, recovery=recovery))
+
+    ray.get(futures)
 
     # Wait for all videos to finish processing.
     ray.get(signal.wait.remote())
@@ -401,6 +405,9 @@ def main(args):
     if args.recovery_type == LOG:
         system_config["logging_enabled"] = True
     ray.init(_system_config=system_config)
+
+    if os.path.exists("/tmp/ray/session_latest/logs/checkpoint.txt"):
+        os.remove("/tmp/ray/session_latest/logs/checkpoint.txt")
 
     process_videos(args.video_path,
             args.max_frames,
