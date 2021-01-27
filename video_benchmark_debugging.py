@@ -9,6 +9,7 @@ import ray.cluster_utils
 import signal
 import sys
 import time
+import psutil
 
 from collections import defaultdict
 
@@ -215,34 +216,50 @@ class Sink:
 
 
 @ray.remote
-def process_chunk(video_index, video_pathname, sink, num_frames, fps, start_timestamp, simulate_failure=False, recovery=CHECKPOINT):
+def fail(fail_time, recovery):
+    diff = fail_time - time.time()
+    if diff > 0:
+        time.sleep(diff)
+
     if recovery == CHECKPOINT:
+        for p in psutil.process_iter():
+            if "ray::process_chunk_helper" in p.name():
+                print("Killing PID", p.pid)
+                os.kill(p.pid, signal.SIGKILL)
+                break
+    else:
+        for p in psutil.process_iter():
+            if "ray::Resizer" in p.name():
+                print("Killing PID", p.pid)
+                os.kill(p.pid, signal.SIGKILL)
+                break
+
+
+@ray.remote
+def process_chunk(video_index, video_pathname, sink, num_frames, fps, start_timestamp, simulate_failure=False, recovery=CHECKPOINT):
+    if simulate_failure:
+        total_time = num_frames / fps
+        fail_time = start_timestamp + total_time / 2
+        fail.remote(fail_time, recovery)
+
+    while True:
         try:
             final_frame = process_chunk_helper.remote(video_index, 
                             video_pathname, 
                             sink, num_frames, fps,
-                            start_timestamp, simulate_failure, recovery=recovery)
+                            start_timestamp, recovery=recovery)
             ray.get(final_frame)
         except ray.exceptions.WorkerCrashedError:
-            final_frame = process_chunk_helper.remote(video_index, 
-                            video_pathname, 
-                            sink, num_frames, fps,
-                            start_timestamp, False, recovery=recovery)
-            ray.get(final_frame)
-    else:
-        final_frame = process_chunk_helper.remote(video_index, 
-                        video_pathname, 
-                        sink, num_frames, fps,
-                        start_timestamp, simulate_failure, recovery=recovery)
-        ray.get(final_frame)
+            assert recovery == CHECKPOINT
+
     print(final_frame)
     return final_frame 
 
 
 # Uses decoder and frame resizer to process each frame in the specified video.
 @ray.remote(max_retries=0)
-def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, start_timestamp, simulate_failure, recovery=CHECKPOINT):
-    print("num frames", num_frames)
+def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, start_timestamp, recovery=CHECKPOINT):
+    print("num frames", num_frames, "pid", os.getpid())
     # Set ray remote parameters for the actors
     # Default: checkpoint recovery/manual restart
     cls_args = {"max_restarts": 0, "max_task_retries": 0}
@@ -284,15 +301,6 @@ def process_chunk_helper(video_index, video_pathname, sink, num_frames, fps, sta
 
     # Process each frame.
     for i in range(0, num_frames - start_frame_idx - 1):
-        # Simulate failure at failure point.
-        if simulate_failure and i == fail_point:
-            print("Killing resizer and decoder")
-            if recovery == CHECKPOINT:
-                sys.exit()
-            else:
-                os.kill(resizer_pid, signal.SIGKILL)
-                #verify_killed(resizer_pid, "Resizer")
-
         # Calculate frame timestamp
         frame_timestamp = start_timestamp + (start_frame_idx + i + 1) / fps
         # Simulate an incoming video stream; need to sleep to output one
